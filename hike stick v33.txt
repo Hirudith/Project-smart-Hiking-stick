@@ -1,0 +1,1920 @@
+/*
+ * HAPTIC HIKER - Smart Hiking Stick Navigation System
+ * VERSION 3.1 - REFINED OUTPUT & SHARP TURN HANDLING
+ * 
+ * Hardware: ESP32, MPU6500, HMC5883L, NEO-M8N GPS, 4x Vibration Motors
+ * Author: Generated for Haptic Hiker Project
+ *
+ * KEY IMPROVEMENTS IN v3.1:
+ * 1. ✅ Clean, Formatted Serial Output - Heading prominently displayed
+ * 2. ✅ Periodic Status Updates - Every 3 seconds regardless of movement
+ * 3. ✅ Sharp Turn Detection - Detects upcoming corners
+ * 4. ✅ Dynamic Look-Ahead - Reduces during sharp turns
+ * 5. ✅ Adaptive Filtering - Faster response in corners
+ * 6. ✅ Path Curvature Analysis - Better trajectory prediction
+ * 7. ✅ Enhanced Rate Limiter - Allows faster turns when needed
+ * 8. ✅ Improved Backward Guidance - Better handling of reverse navigation
+ * 9. ✅ All v3.0 optimizations retained
+ */
+
+// ============================================================================
+// LIBRARY INCLUDES
+// ============================================================================
+#include <Wire.h>
+#include <TinyGPS++.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <MadgwickAHRS.h>
+
+// ============================================================================
+// SECOND I2C BUS DECLARATION
+// ============================================================================
+TwoWire I2C_MAG = TwoWire(1);
+
+// ============================================================================
+// HARDWARE PIN DEFINITIONS
+// ============================================================================
+#define IMU_SDA 25
+#define IMU_SCL 26
+#define MAG_SDA 21
+#define MAG_SCL 22
+#define GPS_RX 16
+#define GPS_TX 17
+#define GPS_BAUD 9600
+#define MOTOR_FRONT 32
+#define MOTOR_RIGHT 33
+#define MOTOR_BACK 13
+#define MOTOR_LEFT 4
+
+// ============================================================================
+// SENSOR I2C ADDRESSES
+// ============================================================================
+#define MPU6500_ADDR 0x68
+#define HMC5883L_ADDR 0x1E
+
+// ============================================================================
+// CONFIGURATION PARAMETERS
+// ============================================================================
+#define MIN_DISTANCE_METERS 10.0
+#define MIN_TIME_SECONDS 15
+#define MAX_WAYPOINTS 500
+
+// === OUTPUT CONTROL ===
+#define STATUS_UPDATE_INTERVAL 3000     // Status every 3 seconds
+#define VERBOSE_DEBUG false             // Set to true for detailed debug
+
+// === IMPROVED GUIDANCE PARAMETERS (v3.1) ===
+#define GPS_SPEED_THRESHOLD 0.8
+#define ARRIVAL_RADIUS 10.0
+#define ARRIVAL_HYSTERESIS 5.0
+
+// === PURE PURSUIT PARAMETERS (v3.1 Enhanced) ===
+#define MIN_LOOKAHEAD_DISTANCE 6.0      // Reduced from 8m for tighter following
+#define MAX_LOOKAHEAD_DISTANCE 20.0     // Reduced from 25m
+#define LOOKAHEAD_TIME 3.5              // Slightly reduced from 4.0s
+#define LOOKAHEAD_GAIN 0.45             // Reduced from 0.5
+
+// === SHARP TURN DETECTION ===
+#define SHARP_TURN_THRESHOLD 45.0       // Degrees - angle change to detect sharp turn
+#define TIGHT_TURN_THRESHOLD 70.0       // Degrees - very tight turn
+#define MIN_LOOKAHEAD_TURN 4.0          // Minimum look-ahead during tight turns
+#define TURN_PREVIEW_DISTANCE 15.0      // Distance to look ahead for turns
+
+// === FILTERING PARAMETERS (v3.1 Adaptive) ===
+#define CTE_FILTER_ALPHA_NORMAL 0.35    // Normal cruising
+#define CTE_FILTER_ALPHA_TURN 0.55      // Faster response in turns
+#define HEADING_FILTER_ALPHA 0.25
+#define MAX_HEADING_RATE_NORMAL 35.0    // Normal max rate (deg/s)
+#define MAX_HEADING_RATE_TURN 60.0      // Allow faster changes in sharp turns
+
+// === GUIDANCE BEHAVIOR ===
+#define HEADING_TOLERANCE_MOVING 20.0
+#define HEADING_TOLERANCE_SLOW 30.0
+#define CONFIRMATION_INTERVAL 18000
+#define MIN_VIBRATION_INTERVAL 1200
+
+// === SENSOR FUSION PARAMETERS ===
+#define IMU_SAMPLE_RATE_HZ 100.0f
+#define MAG_UPDATE_INTERVAL_MS 100
+
+// === MAGNETIC DECLINATION ===
+#define MAGNETIC_DECLINATION_DEG 1.6
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+struct Waypoint {
+    double latitude;
+    double longitude;
+    float bearing;
+    float distance;
+    unsigned long timestamp;
+};
+
+struct SensorData {
+    float roll, pitch;
+    float magHeading;
+    double gpsLat, gpsLon;
+    float gpsHeading;
+    float gpsSpeed;
+    bool gpsValid;
+    float fusedHeading;
+};
+
+enum SystemMode {
+    MODE_IDLE,
+    MODE_RECORDING,
+    MODE_GUIDANCE,
+    MODE_DOWNLOAD,
+    MODE_UPLOAD
+};
+
+struct PathMetrics {
+    float cte;
+    float alongTrackDistance;
+    float distanceToTarget;
+    float pathBearing;
+    float nextSegmentBearing;
+    float pathCurvature;
+};
+
+// === v3.1: Enhanced Pure Pursuit Controller ===
+struct PurePursuitController {
+    float lookAheadDistance;
+    float filteredCTE;
+    float lastTargetBearing;
+    float headingChangeRate;
+    unsigned long lastUpdateTime;
+    bool initialized;
+    bool inSharpTurn;
+    float currentCurvature;
+    
+    void reset() {
+        lookAheadDistance = MIN_LOOKAHEAD_DISTANCE;
+        filteredCTE = 0;
+        lastTargetBearing = 0;
+        headingChangeRate = 0;
+        lastUpdateTime = millis();
+        initialized = false;
+        inSharpTurn = false;
+        currentCurvature = 0;
+    }
+    
+    float calculateLookAhead(float speed, float cte, float pathCurvature) {
+        float speedBasedLookAhead = MIN_LOOKAHEAD_DISTANCE + (speed * LOOKAHEAD_GAIN * LOOKAHEAD_TIME);
+        speedBasedLookAhead = constrain(speedBasedLookAhead, MIN_LOOKAHEAD_DISTANCE, MAX_LOOKAHEAD_DISTANCE);
+        
+        float cteFactor = 1.0;
+        if (abs(cte) > 15.0) {
+            cteFactor = 0.7;
+        }
+        
+        float curvatureFactor = 1.0;
+        if (pathCurvature > SHARP_TURN_THRESHOLD) {
+            inSharpTurn = true;
+            curvatureFactor = 0.5;
+            
+            if (pathCurvature > TIGHT_TURN_THRESHOLD) {
+                curvatureFactor = 0.35;
+            }
+        } else {
+            inSharpTurn = false;
+        }
+        
+        lookAheadDistance = speedBasedLookAhead * cteFactor * curvatureFactor;
+        lookAheadDistance = constrain(lookAheadDistance, MIN_LOOKAHEAD_TURN, MAX_LOOKAHEAD_DISTANCE);
+        
+        currentCurvature = pathCurvature;
+        return lookAheadDistance;
+    }
+    
+    float filterCTE(float rawCTE, bool inTurn) {
+        float alpha = inTurn ? CTE_FILTER_ALPHA_TURN : CTE_FILTER_ALPHA_NORMAL;
+        
+        if (!initialized) {
+            filteredCTE = rawCTE;
+            initialized = true;
+        } else {
+            filteredCTE = (alpha * rawCTE) + ((1.0 - alpha) * filteredCTE);
+        }
+        return filteredCTE;
+    }
+    
+    float limitHeadingChange(float targetBearing, float currentHeading, bool inTurn) {
+        unsigned long now = millis();
+        float dt = (now - lastUpdateTime) / 1000.0;
+        if (dt > 1.0 || dt == 0.0) dt = 0.1;
+        
+        float error = targetBearing - lastTargetBearing;
+        while (error > 180) error -= 360;
+        while (error < -180) error += 360;
+        
+        float maxRate = inTurn ? MAX_HEADING_RATE_TURN : MAX_HEADING_RATE_NORMAL;
+        float maxChange = maxRate * dt;
+        
+        if (abs(error) > maxChange) {
+            error = (error > 0) ? maxChange : -maxChange;
+        }
+        
+        float limitedBearing = lastTargetBearing + error;
+        while (limitedBearing < 0) limitedBearing += 360;
+        while (limitedBearing >= 360) limitedBearing -= 360;
+        
+        lastTargetBearing = limitedBearing;
+        lastUpdateTime = now;
+        headingChangeRate = abs(error) / dt;
+        
+        return limitedBearing;
+    }
+};
+
+struct MotorController {
+    unsigned long vibrateStartTime;
+    unsigned long vibrateDuration;
+    bool isVibrating;
+    int activeMotor;
+    int comboMotor2;
+    int targetPWM;
+    int currentPWM;
+    
+    void reset() {
+        isVibrating = false;
+        activeMotor = 0;
+        comboMotor2 = 0;
+        vibrateDuration = 0;
+        targetPWM = 0;
+        currentPWM = 0;
+        stopAll();
+    }
+    
+    void startVibration(int motor1, int motor2, int pwm, int durationMs) {
+        if (isVibrating) return;
+
+        activeMotor = motor1;
+        comboMotor2 = motor2;
+        targetPWM = pwm;
+        currentPWM = pwm;
+        vibrateStartTime = millis();
+        vibrateDuration = durationMs;
+        isVibrating = true;
+        
+        if (motor1 == 1) analogWrite(MOTOR_FRONT, currentPWM);
+        else if (motor1 == 2) analogWrite(MOTOR_RIGHT, currentPWM);
+        else if (motor1 == 3) analogWrite(MOTOR_BACK, currentPWM);
+        else if (motor1 == 4) analogWrite(MOTOR_LEFT, currentPWM);
+        
+        if (motor2 > 0) {
+            if (motor2 == 1) analogWrite(MOTOR_FRONT, currentPWM);
+            else if (motor2 == 2) analogWrite(MOTOR_RIGHT, currentPWM);
+            else if (motor2 == 3) analogWrite(MOTOR_BACK, currentPWM);
+            else if (motor2 == 4) analogWrite(MOTOR_LEFT, currentPWM);
+        }
+    }
+    
+    void update() {
+        if (isVibrating && (millis() - vibrateStartTime > vibrateDuration)) {
+            stopAll();
+            isVibrating = false;
+        }
+    }
+    
+    void stopAll() {
+        analogWrite(MOTOR_FRONT, 0);
+        analogWrite(MOTOR_RIGHT, 0);
+        analogWrite(MOTOR_BACK, 0);
+        analogWrite(MOTOR_LEFT, 0);
+        isVibrating = false;
+    }
+};
+
+// ============================================================================
+// GLOBAL OBJECTS
+// ============================================================================
+TinyGPSPlus gps;
+HardwareSerial GPSSerial(2);
+Madgwick filter;
+WebServer server(80);
+File fsUploadFile;
+
+SystemMode currentMode = MODE_IDLE;
+SensorData sensors;
+bool wifiEnabled = false;
+
+PurePursuitController pursuitCtrl;
+MotorController motorCtrl;
+
+Waypoint currentPath[MAX_WAYPOINTS];
+int waypointCount = 0;
+Waypoint lastRecordedWaypoint;
+unsigned long lastWaypointTime = 0;
+
+int currentWaypointIndex = 0;
+unsigned long lastConfirmationTime = 0;
+unsigned long lastVibrationTime = 0;
+unsigned long lastStatusUpdate = 0;
+bool guidanceActive = false;
+bool guidanceIsForward = true;
+bool waypointJustPassed = false;
+bool verboseMode = VERBOSE_DEBUG;
+
+float compassBias = 0.0;
+
+int16_t ax, ay, az, gx, gy, gz, mx, my, mz;
+float gyroX, gyroY, gyroZ;
+
+float gyro_offset_x = -382.033997;
+float gyro_offset_y = 138.577499;
+float gyro_offset_z = 31.257999;
+float mag_offset_x = -716.50;
+float mag_offset_y = 311.50;
+float mag_offset_z = -707.50;
+float mag_scale_x = 0.9041;
+float mag_scale_y = 1.1345;
+float mag_scale_z = 0.9877;
+
+unsigned long lastIMUUpdate = 0;
+unsigned long lastMagUpdate = 0;
+unsigned long lastGPSUpdate = 0;
+const unsigned long IMU_UPDATE_INTERVAL = 10;
+const unsigned long GPS_UPDATE_INTERVAL = 1000;
+
+// ============================================================================
+// WEB INTERFACE
+// ============================================================================
+const char HTML_INDEX[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Haptic Hiker Control</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f4f4; color: #333; max-width: 600px; margin: 20px auto; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        h1 { color: #0056b3; text-align: center; }
+        .card { background: #fff; border-radius: 6px; padding: 20px; margin-bottom: 20px; }
+        .card h2 { margin-top: 0; }
+        .btn { background-color: #007bff; color: white; padding: 10px 15px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block; border: none; cursor: pointer; }
+        .btn:hover { background-color: #0056b3; }
+        .btn-download { background-color: #28a745; }
+        .btn-download:hover { background-color: #218838; }
+        input[type="file"] { margin-top: 10px; }
+        #status { background: #333; color: #fff; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 0.9em; white-space: pre-wrap; margin-top: 15px; }
+        code { background: #eee; padding: 2px 5px; border-radius: 3px; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <h1>Haptic Hiker v3.1</h1>
+    <div class="card">
+        <h2>Download Recorded Path</h2>
+        <p>Download the path currently saved on the Hiker as a JSON file.</p>
+        <a href="/download" class="btn btn-download">Download 'hiker_path.json'</a>
+    </div>
+    <div class="card">
+        <h2>Upload New Path</h2>
+        <p>Upload a JSON file containing a list of coordinate pairs.
+           <br>Format: <code>[[lat, lon], [lat, lon], ...]</code>
+           <br>This will overwrite the '/download.dat' file.</p>
+        <form id="upload-form" action="/upload" method="POST" enctype="multipart/form-data">
+            <input type="file" name="pathfile" id="pathfile" accept=".json" required>
+            <br><br>
+            <input type="submit" value="Upload Path" class="btn">
+        </form>
+        <div id="status">Upload status will appear here.</div>
+    </div>
+    <script>
+        const form = document.getElementById('upload-form');
+        const statusDiv = document.getElementById('status');
+        form.addEventListener('submit', function(e) {
+            e.preventDefault();
+            statusDiv.textContent = 'Uploading... Please wait.';
+            const formData = new FormData(form);
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.text())
+            .then(data => {
+                statusDiv.textContent = data;
+            })
+            .catch(error => {
+                statusDiv.textContent = 'Error: ' + error;
+            });
+        });
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+void setupIMU();
+void setupMagnetometer();
+void setupGPS();
+void setupMotors();
+void setupWiFi();
+void updateIMU();
+void updateMagnetometer();
+void updateGPS();
+void fuseSensorData();
+void recordWaypoint();
+bool shouldRecordWaypoint();
+void startGuidance(bool isForward);
+void updateGuidance();
+void vibrateDirection(float targetHeading, float intensity);
+void vibrateConfirmation();
+float calculateBearing(double lat1, double lon1, double lat2, double lon2);
+float calculateDistance(double lat1, double lon1, double lat2, double lon2);
+void savePath(const char* filename);
+bool loadPath(const char* filename);
+void handleSerialCommands();
+void calibrateMagnetometer();
+PathMetrics getPathMetrics(Waypoint wpA, Waypoint wpB, double latUs, double lonUs);
+float normalizeAngle(float angle);
+void handleDownloadPath();
+void handleStatus();
+void handleUploadSuccess();
+void handleUploadFile();
+void parseUploadedJSON();
+void printCleanStatus();
+float calculatePathCurvature(int currentIdx, bool isForward);
+
+// ============================================================================
+// v3.1: CLEAN STATUS OUTPUT
+// ============================================================================
+void printCleanStatus() {
+    Serial.println();
+    Serial.println("┌────────────────────────────────────────┐");
+    Serial.println("│       HAPTIC HIKER STATUS v3.1        │");
+    Serial.println("└────────────────────────────────────────┘");
+    
+    // Mode
+    Serial.print("  Mode: ");
+    switch(currentMode) {
+        case MODE_IDLE: Serial.println("IDLE"); break;
+        case MODE_RECORDING: Serial.println("📍 RECORDING PATH"); break;
+        case MODE_GUIDANCE: Serial.println("🧭 ACTIVE GUIDANCE"); break;
+        default: Serial.println("UNKNOWN"); break;
+    }
+    
+    // GPS Status
+    Serial.print("  GPS:  ");
+    if (sensors.gpsValid) {
+        Serial.print("✓ LOCKED (");
+        Serial.print(gps.satellites.value());
+        Serial.print(" sats, HDOP ");
+        Serial.print(gps.hdop.value() / 100.0, 1);
+        Serial.println(")");
+    } else {
+        Serial.println("✗ Waiting for fix...");
+    }
+    
+    // *** HEADING - PROMINENTLY DISPLAYED ***
+    Serial.println("  ┌──────────────────────────────────────┐");
+    Serial.print("  │  FACING: ");
+    if (sensors.fusedHeading >= 0) {
+        // Convert heading to 8-direction format (matching motor pattern)
+        float h = sensors.fusedHeading;
+        
+        if (h >= 337.5 || h < 22.5) {
+            Serial.print("FRONT          ");
+        } else if (h >= 22.5 && h < 67.5) {
+            Serial.print("FRONT-RIGHT    ");
+        } else if (h >= 67.5 && h < 112.5) {
+            Serial.print("RIGHT          ");
+        } else if (h >= 112.5 && h < 157.5) {
+            Serial.print("BACK-RIGHT     ");
+        } else if (h >= 157.5 && h < 202.5) {
+            Serial.print("BACK           ");
+        } else if (h >= 202.5 && h < 247.5) {
+            Serial.print("BACK-LEFT      ");
+        } else if (h >= 247.5 && h < 292.5) {
+            Serial.print("LEFT           ");
+        } else {
+            Serial.print("FRONT-LEFT     ");
+        }
+        
+        // Add degrees in parentheses
+        char degStr[8];
+        sprintf(degStr, "(%3.0f°)", h);
+        Serial.print(degStr);
+        Serial.println("  │");
+    } else {
+        Serial.println("---            │");
+    }
+    Serial.println("  └──────────────────────────────────────┘");
+    
+    // Show turn direction if in guidance mode
+    if (guidanceActive && currentWaypointIndex >= 0 && currentWaypointIndex < waypointCount) {
+        // Calculate where we need to go
+        Waypoint targetWP = currentPath[currentWaypointIndex];
+        float targetBearing = calculateBearing(sensors.gpsLat, sensors.gpsLon, 
+                                               targetWP.latitude, targetWP.longitude);
+        
+        // Calculate relative angle (same logic as vibrateDirection)
+        float relativeAngle = targetBearing - sensors.fusedHeading;
+        while (relativeAngle > 180) relativeAngle -= 360;
+        while (relativeAngle < -180) relativeAngle += 360;
+        
+        Serial.print("  → TURN: ");
+        
+        if (relativeAngle >= -22.5 && relativeAngle < 22.5) {
+            Serial.print("STRAIGHT AHEAD");
+        } else if (relativeAngle >= 22.5 && relativeAngle < 67.5) {
+            Serial.print("SLIGHT RIGHT  ");
+        } else if (relativeAngle >= 67.5 && relativeAngle < 112.5) {
+            Serial.print("HARD RIGHT    ");
+        } else if (relativeAngle >= 112.5 && relativeAngle < 157.5) {
+            Serial.print("SHARP RIGHT   ");
+        } else if (relativeAngle >= 157.5 || relativeAngle < -157.5) {
+            Serial.print("TURN AROUND   ");
+        } else if (relativeAngle >= -157.5 && relativeAngle < -112.5) {
+            Serial.print("SHARP LEFT    ");
+        } else if (relativeAngle >= -112.5 && relativeAngle < -67.5) {
+            Serial.print("HARD LEFT     ");
+        } else {
+            Serial.print("SLIGHT LEFT   ");
+        }
+        
+        char relStr[10];
+        sprintf(relStr, " (%+4.0f°)", relativeAngle);
+        Serial.println(relStr);
+    }
+    
+    // Speed
+    if (sensors.gpsValid) {
+        Serial.print("  Speed: ");
+        Serial.print(sensors.gpsSpeed, 1);
+        Serial.print(" m/s  (");
+        Serial.print(sensors.gpsSpeed * 3.6, 1);
+        Serial.println(" km/h)");
+    }
+    
+    // Guidance info
+    if (guidanceActive) {
+        Serial.println("  ────────────────────────────────────────");
+        Serial.print("  Target WP: ");
+        Serial.print(currentWaypointIndex);
+        Serial.print(" of ");
+        Serial.println(waypointCount - 1);
+        
+        Serial.print("  Progress:  [");
+        int progress = (currentWaypointIndex * 20) / (waypointCount - 1);
+        for (int i = 0; i < 20; i++) {
+            Serial.print(i < progress ? "█" : "░");
+        }
+        Serial.println("]");
+        
+        // Compact guidance metrics on one line
+        Serial.print("  CTE: ");
+        Serial.print(pursuitCtrl.filteredCTE, 1);
+        Serial.print("m | LA: ");
+        Serial.print(pursuitCtrl.lookAheadDistance, 1);
+        Serial.print("m | ");
+        if (pursuitCtrl.inSharpTurn) {
+            Serial.print("⚠ SHARP TURN (");
+            Serial.print(pursuitCtrl.currentCurvature, 0);
+            Serial.print("°)");
+        } else {
+            Serial.print("Straight");
+        }
+        Serial.println();
+    } else if (currentMode == MODE_RECORDING) {
+        Serial.print("  Waypoints recorded: ");
+        Serial.println(waypointCount);
+    }
+    
+    // Compressed debug info (if verbose mode)
+    if (verboseMode) {
+        Serial.println("  ────────────────────────────────────────");
+        Serial.print("  Debug: Mag=");
+        Serial.print(sensors.magHeading, 0);
+        Serial.print("° Bias=");
+        Serial.print(compassBias, 1);
+        Serial.print("° R=");
+        Serial.print(sensors.roll, 0);
+        Serial.print("° P=");
+        Serial.print(sensors.pitch, 0);
+        Serial.println("°");
+    }
+    
+    Serial.println("└────────────────────────────────────────┘");
+    Serial.println();
+}
+
+// ============================================================================
+// v3.1: CALCULATE PATH CURVATURE
+// ============================================================================
+float calculatePathCurvature(int currentIdx, bool isForward) {
+    if (waypointCount < 3) return 0;
+    
+    int idxA, idxB, idxC;
+    
+    if (isForward) {
+        if (currentIdx == 0 || currentIdx >= waypointCount - 1) return 0;
+        idxA = currentIdx - 1;
+        idxB = currentIdx;
+        idxC = currentIdx + 1;
+    } else {
+        if (currentIdx <= 0 || currentIdx >= waypointCount - 1) return 0;
+        idxA = currentIdx + 1;
+        idxB = currentIdx;
+        idxC = (currentIdx == 0) ? 1 : currentIdx - 1;
+    }
+    
+    float bearing_AB = calculateBearing(
+        currentPath[idxA].latitude, currentPath[idxA].longitude,
+        currentPath[idxB].latitude, currentPath[idxB].longitude
+    );
+    
+    float bearing_BC = calculateBearing(
+        currentPath[idxB].latitude, currentPath[idxB].longitude,
+        currentPath[idxC].latitude, currentPath[idxC].longitude
+    );
+    
+    float curvature = abs(normalizeAngle(bearing_BC - bearing_AB));
+    return curvature;
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    
+    Serial.println("\n\n");
+    Serial.println("╔════════════════════════════════════════╗");
+    Serial.println("║   HAPTIC HIKER NAVIGATION SYSTEM      ║");
+    Serial.println("║   Version 3.1 - Sharp Turn Enhanced   ║");
+    Serial.println("╚════════════════════════════════════════╝");
+    Serial.println();
+
+    Wire.begin(IMU_SDA, IMU_SCL);
+    Wire.setClock(400000);
+    Serial.println("[INIT] I2C Bus 0 (MPU6500) - GPIO 25/26");
+
+    I2C_MAG.begin(MAG_SDA, MAG_SCL);
+    I2C_MAG.setClock(400000);
+    Serial.println("[INIT] I2C Bus 1 (HMC5883L) - GPIO 21/22");
+
+    if (!SPIFFS.begin(true)) {
+        Serial.println("[ERROR] SPIFFS mount failed!");
+    } else {
+        Serial.println("[INIT] SPIFFS ready");
+    }
+    
+    setupMotors();
+    setupIMU();
+    setupMagnetometer();
+    setupGPS();
+
+    filter.begin(IMU_SAMPLE_RATE_HZ);
+    
+    sensors.gpsValid = false;
+    sensors.fusedHeading = -1.0;
+    
+    motorCtrl.reset();
+    pursuitCtrl.reset();
+    
+    Serial.println();
+    Serial.println("═══ COMMANDS ═══════════════════════════");
+    Serial.println("  r - Record path      f - Guide FORWARD");
+    Serial.println("  s - Stop & save      g - Guide BACKWARD");
+    Serial.println("  l - Load path        d - Load download");
+    Serial.println("  x - Stop all         w - Enable WiFi");
+    Serial.println("  c - Calibrate mag    i - System info");
+    Serial.println("  h - Heading debug    v - Toggle verbose");
+    Serial.println("════════════════════════════════════════");
+    Serial.println();
+    
+    Serial.print("⚠  Magnetic declination: ");
+    Serial.print(MAGNETIC_DECLINATION_DEG);
+    Serial.println("°");
+    Serial.println();
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
+    unsigned long currentTime = millis();
+
+    motorCtrl.update();
+
+    if (currentTime - lastIMUUpdate >= IMU_UPDATE_INTERVAL) {
+        updateIMU();
+        lastIMUUpdate = currentTime;
+    }
+
+    if (currentTime - lastMagUpdate >= MAG_UPDATE_INTERVAL_MS) {
+        updateMagnetometer();
+        fuseSensorData();
+        lastMagUpdate = currentTime;
+    }
+    
+    while (GPSSerial.available() > 0) {
+        gps.encode(GPSSerial.read());
+    }
+    
+    if (currentTime - lastGPSUpdate >= GPS_UPDATE_INTERVAL) {
+        updateGPS();
+        lastGPSUpdate = currentTime;
+
+        if (sensors.gpsValid && sensors.gpsSpeed > GPS_SPEED_THRESHOLD) {
+            float currentCorrectedHeading = sensors.magHeading + MAGNETIC_DECLINATION_DEG + compassBias;
+            while (currentCorrectedHeading < 0.0) currentCorrectedHeading += 360.0;
+            while (currentCorrectedHeading >= 360.0) currentCorrectedHeading -= 360.0;
+
+            float error = sensors.gpsHeading - currentCorrectedHeading;
+            while (error > 180.0) error -= 360.0;
+            while (error < -180.0) error += 360.0;
+
+            compassBias += 0.05 * error;
+            if (compassBias > 180.0) compassBias -= 360.0;
+            if (compassBias < -180.0) compassBias += 360.0;
+        }
+    }
+    
+    // Periodic status update (every 3 seconds)
+    if (currentTime - lastStatusUpdate >= STATUS_UPDATE_INTERVAL) {
+        printCleanStatus();
+        lastStatusUpdate = currentTime;
+    }
+    
+    switch (currentMode) {
+        case MODE_RECORDING:
+            if (shouldRecordWaypoint()) {
+                recordWaypoint();
+            }
+            break;
+        case MODE_GUIDANCE:
+            updateGuidance();
+            break;
+        case MODE_IDLE:
+            break;
+    }
+    
+    handleSerialCommands();
+
+    if (wifiEnabled) {
+        server.handleClient();
+    }
+}
+
+// ============================================================================
+// IMU
+// ============================================================================
+void setupIMU() {
+    if (verboseMode) Serial.println("[INIT] Configuring MPU6500...");
+    Wire.beginTransmission(MPU6500_ADDR);
+    Wire.write(0x6B);
+    Wire.write(0x00);
+    Wire.endTransmission();
+    delay(100);
+
+    Wire.beginTransmission(MPU6500_ADDR);
+    Wire.write(0x1C);
+    Wire.write(0x08);
+    Wire.endTransmission();
+    
+    Wire.beginTransmission(MPU6500_ADDR);
+    Wire.write(0x1B);
+    Wire.write(0x08);
+    Wire.endTransmission();
+
+    Wire.beginTransmission(MPU6500_ADDR);
+    Wire.write(0x1A);
+    Wire.write(0x03);
+    Wire.endTransmission();
+    
+    if (!verboseMode) Serial.println("[INIT] MPU6500 ready");
+    sensors.roll = 0;
+    sensors.pitch = 0;
+}
+
+void updateIMU() {
+    Wire.beginTransmission(MPU6500_ADDR);
+    Wire.write(0x3B);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU6500_ADDR, 6, true);
+    
+    ax = Wire.read() << 8 | Wire.read();
+    ay = Wire.read() << 8 | Wire.read();
+    az = Wire.read() << 8 | Wire.read();
+    
+    Wire.beginTransmission(MPU6500_ADDR);
+    Wire.write(0x43);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU6500_ADDR, 6, true);
+    
+    gx = Wire.read() << 8 | Wire.read();
+    gy = Wire.read() << 8 | Wire.read();
+    gz = Wire.read() << 8 | Wire.read();
+    
+    gyroX = (gx - gyro_offset_x) / 65.5 * DEG_TO_RAD;
+    gyroY = (gy - gyro_offset_y) / 65.5 * DEG_TO_RAD;
+    gyroZ = -(gz - gyro_offset_z) / 65.5 * DEG_TO_RAD;
+    
+    filter.updateIMU(gyroX, gyroY, gyroZ, ax, ay, az);
+        
+    sensors.roll = filter.getRoll();
+    sensors.pitch = filter.getPitch();
+}
+
+// ============================================================================
+// MAGNETOMETER
+// ============================================================================
+void setupMagnetometer() {
+    if (verboseMode) Serial.println("[INIT] Configuring HMC5883L...");
+    
+    I2C_MAG.beginTransmission(HMC5883L_ADDR);
+    I2C_MAG.write(0x02);
+    I2C_MAG.write(0x00);
+    I2C_MAG.endTransmission();
+    delay(100);
+
+    I2C_MAG.beginTransmission(HMC5883L_ADDR);
+    I2C_MAG.write(0x01);
+    I2C_MAG.write(0x20);
+    I2C_MAG.endTransmission();
+
+    I2C_MAG.beginTransmission(HMC5883L_ADDR);
+    I2C_MAG.write(0x00);
+    I2C_MAG.write(0x10);
+    I2C_MAG.endTransmission();
+    
+    if (!verboseMode) Serial.println("[INIT] HMC5883L ready");
+}
+
+void updateMagnetometer() {
+    I2C_MAG.beginTransmission(HMC5883L_ADDR);
+    I2C_MAG.write(0x03);
+    I2C_MAG.endTransmission(false);
+    I2C_MAG.requestFrom(HMC5883L_ADDR, 6);
+    
+    if (I2C_MAG.available() >= 6) {
+        mx = I2C_MAG.read() << 8 | I2C_MAG.read();
+        mz = I2C_MAG.read() << 8 | I2C_MAG.read();
+        my = I2C_MAG.read() << 8 | I2C_MAG.read();
+
+        float mx_cal = (mx - mag_offset_x) * mag_scale_x;
+        float my_cal = (my - mag_offset_y) * mag_scale_y;
+        float mz_cal = (mz - mag_offset_z) * mag_scale_z;
+
+        float rollRad = sensors.roll * DEG_TO_RAD;
+        float pitchRad = sensors.pitch * DEG_TO_RAD;
+        
+        float magX = mx_cal * cos(pitchRad) + my_cal * sin(rollRad) * sin(pitchRad) 
+                     - mz_cal * cos(rollRad) * sin(pitchRad);
+        float magY = my_cal * cos(rollRad) + mz_cal * sin(rollRad);
+
+        float heading = atan2(magY, magX) * RAD_TO_DEG;
+        if (heading < 0) heading += 360;
+        sensors.magHeading = 360 - heading;
+    }
+}
+
+// ============================================================================
+// GPS
+// ============================================================================
+void setupGPS() {
+    if (verboseMode) Serial.println("[INIT] Starting GPS...");
+    GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+    if (!verboseMode) Serial.println("[INIT] GPS ready");
+}
+
+void updateGPS() {
+    bool isGpsGood = gps.location.isValid() && gps.location.age() < 2000 &&
+                     gps.hdop.isValid() && gps.hdop.value() < 300 &&
+                     gps.satellites.isValid() && gps.satellites.value() >= 4;
+
+    if (isGpsGood) {
+        sensors.gpsLat = gps.location.lat();
+        sensors.gpsLon = gps.location.lng();
+        sensors.gpsValid = true;
+        
+        if (gps.course.isValid()) {
+            sensors.gpsHeading = gps.course.deg();
+        }
+        
+        if (gps.speed.isValid()) {
+            sensors.gpsSpeed = gps.speed.mps();
+        }
+    } else {
+        sensors.gpsValid = false;
+    }
+}
+
+// ============================================================================
+// SENSOR FUSION
+// ============================================================================
+void fuseSensorData() {
+    float compassHeadingMagnetic = sensors.magHeading; 
+    float compassHeadingTrue = compassHeadingMagnetic + MAGNETIC_DECLINATION_DEG + compassBias;
+    
+    while (compassHeadingTrue < 0.0) compassHeadingTrue += 360.0;
+    while (compassHeadingTrue >= 360.0) compassHeadingTrue -= 360.0;
+    
+    float targetHeading = compassHeadingTrue;
+    float alpha = (sensors.gpsSpeed > GPS_SPEED_THRESHOLD) ? 0.10 : 0.05;
+
+    if (sensors.fusedHeading == -1.0) {
+        sensors.fusedHeading = targetHeading;
+    } else {
+        float error = targetHeading - sensors.fusedHeading;
+        while (error > 180.0) error -= 360.0;
+        while (error < -180.0) error += 360.0;
+        
+        sensors.fusedHeading += alpha * error;
+        while (sensors.fusedHeading < 0.0) sensors.fusedHeading += 360.0;
+        while (sensors.fusedHeading >= 360.0) sensors.fusedHeading -= 360.0;
+    }
+}
+
+// ============================================================================
+// MOTOR CONTROL
+// ============================================================================
+void setupMotors() {
+    pinMode(MOTOR_FRONT, OUTPUT);
+    pinMode(MOTOR_RIGHT, OUTPUT);
+    pinMode(MOTOR_BACK, OUTPUT);
+    pinMode(MOTOR_LEFT, OUTPUT);
+    digitalWrite(MOTOR_FRONT, LOW);
+    digitalWrite(MOTOR_RIGHT, LOW);
+    digitalWrite(MOTOR_BACK, LOW);
+    digitalWrite(MOTOR_LEFT, LOW);
+    if (!verboseMode) Serial.println("[INIT] Motors ready - GPIO 32/33/13/4");
+}
+
+void vibrateDirection(float targetHeading, float intensity) {
+    float relativeAngle = targetHeading - sensors.fusedHeading;
+    
+    while (relativeAngle > 180) relativeAngle -= 360;
+    while (relativeAngle < -180) relativeAngle += 360;
+    
+    int pwmValue = (int)(intensity * 255);
+    
+    int motor1 = 0, motor2 = 0;
+    
+    if (relativeAngle >= -22.5 && relativeAngle < 22.5) {
+        motor1 = 1; // front
+    }
+    else if (relativeAngle >= 22.5 && relativeAngle < 67.5) {
+        motor1 = 1; motor2 = 4; // front-right
+    }
+    else if (relativeAngle >= 67.5 && relativeAngle < 112.5) {
+        motor1 = 4; // right
+    }
+    else if (relativeAngle >= 112.5 && relativeAngle < 157.5) {
+        motor1 = 3; motor2 = 4; // back-left
+    }
+    else if (relativeAngle >= 157.5 || relativeAngle < -157.5) {
+        motor1 = 3; // back
+    }
+    else if (relativeAngle >= -157.5 && relativeAngle < -112.5) {
+        motor1 = 3; motor2 = 2; // back-right
+    }
+    else if (relativeAngle >= -112.5 && relativeAngle < -67.5) {
+        motor1 = 2; // left
+    }
+    else {
+        motor1 = 1; motor2 = 2; // front-left
+    }
+    
+    motorCtrl.startVibration(motor1, motor2, pwmValue, 200);
+}
+
+void vibrateConfirmation() {
+    motorCtrl.startVibration(1, 0, 180, 150);
+}
+
+// ============================================================================
+// PATH RECORDING
+// ============================================================================
+bool shouldRecordWaypoint() {
+    if (!sensors.gpsValid) return false;
+    if (waypointCount >= MAX_WAYPOINTS) return false;
+    if (waypointCount == 0) return true;
+
+    unsigned long timeSinceLastPoint = (millis() - lastWaypointTime) / 1000;
+    float distanceFromLast = calculateDistance(
+        lastRecordedWaypoint.latitude,
+        lastRecordedWaypoint.longitude,
+        sensors.gpsLat,
+        sensors.gpsLon
+    );
+
+    return (distanceFromLast >= MIN_DISTANCE_METERS && 
+            timeSinceLastPoint >= MIN_TIME_SECONDS);
+}
+
+void recordWaypoint() {
+    Waypoint wp;
+    wp.latitude = sensors.gpsLat;
+    wp.longitude = sensors.gpsLon;
+    wp.timestamp = millis();
+
+    if (waypointCount > 0) {
+        currentPath[waypointCount - 1].bearing = calculateBearing(
+            currentPath[waypointCount - 1].latitude,
+            currentPath[waypointCount - 1].longitude,
+            wp.latitude,
+            wp.longitude
+        );
+        currentPath[waypointCount - 1].distance = calculateDistance(
+            currentPath[waypointCount - 1].latitude,
+            currentPath[waypointCount - 1].longitude,
+            wp.latitude,
+            wp.longitude
+        );
+    }
+    
+    wp.bearing = 0;
+    wp.distance = 0;
+    
+    currentPath[waypointCount++] = wp;
+    lastRecordedWaypoint = wp;
+    lastWaypointTime = millis();
+    
+    Serial.print("📍 Waypoint ");
+    Serial.print(waypointCount);
+    Serial.print(": ");
+    Serial.print(wp.latitude, 6);
+    Serial.print(", ");
+    Serial.println(wp.longitude, 6);
+}
+
+// ============================================================================
+// NAVIGATION MATH
+// ============================================================================
+float calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+    const float R = 6371000.0;
+    
+    float dLat = (lat2 - lat1) * DEG_TO_RAD;
+    float dLon = (lon2 - lon1) * DEG_TO_RAD;
+    
+    float a = sin(dLat / 2) * sin(dLat / 2) +
+              cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD) *
+              sin(dLon / 2) * sin(dLon / 2);
+    float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    
+    return R * c;
+}
+
+float calculateBearing(double lat1, double lon1, double lat2, double lon2) {
+    float dLon = (lon2 - lon1) * DEG_TO_RAD;
+    lat1 = lat1 * DEG_TO_RAD;
+    lat2 = lat2 * DEG_TO_RAD;
+    
+    float y = sin(dLon) * cos(lat2);
+    float x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
+    
+    float bearing = atan2(y, x) * RAD_TO_DEG;
+    if (bearing < 0) bearing += 360;
+    
+    return bearing;
+}
+
+PathMetrics getPathMetrics(Waypoint wpA, Waypoint wpB, double latUs, double lonUs) {
+    const float R = 6371000.0;
+    
+    float dist_A_Us = calculateDistance(wpA.latitude, wpA.longitude, latUs, lonUs);
+    float bearing_AB = calculateBearing(wpA.latitude, wpA.longitude, wpB.latitude, wpB.longitude);
+    float bearing_A_Us = calculateBearing(wpA.latitude, wpA.longitude, latUs, lonUs);
+    float angle_diff_rad = (bearing_A_Us - bearing_AB) * DEG_TO_RAD;
+    
+    float cte = asin(sin(dist_A_Us / R) * sin(angle_diff_rad)) * R;
+    float alongTrackDistance = acos(cos(dist_A_Us / R) / cos(cte / R)) * R;
+
+    if (abs(angle_diff_rad) > (PI / 2.0)) {
+        alongTrackDistance = -alongTrackDistance;
+    }
+
+    PathMetrics metrics;
+    metrics.cte = cte;
+    metrics.alongTrackDistance = alongTrackDistance;
+    metrics.distanceToTarget = calculateDistance(latUs, lonUs, wpB.latitude, wpB.longitude);
+    metrics.pathBearing = bearing_AB;
+    metrics.nextSegmentBearing = 0;
+    metrics.pathCurvature = 0;
+    
+    return metrics;
+}
+
+float normalizeAngle(float angle) {
+    while (angle > 180) angle -= 360;
+    while (angle < -180) angle += 360;
+    return angle;
+}
+
+// ============================================================================
+// v3.1: GUIDANCE - ENHANCED WITH SHARP TURN DETECTION
+// ============================================================================
+void startGuidance(bool isForward) {
+    if (waypointCount < 2) {
+        Serial.println("❌ Need at least 2 waypoints");
+        return;
+    }
+    
+    if (!sensors.gpsValid) {
+        Serial.println("❌ Waiting for GPS fix...");
+        return;
+    }
+
+    guidanceIsForward = isForward;
+
+    float minDistanceToPath = 999999.0;
+    int bestSegmentIndex = 0;
+
+    for (int i = 0; i < waypointCount - 1; i++) {
+        Waypoint wp_A = currentPath[i];
+        Waypoint wp_B = currentPath[i+1];
+        
+        PathMetrics metrics = getPathMetrics(wp_A, wp_B, sensors.gpsLat, sensors.gpsLon);
+        float segmentLength = calculateDistance(wp_A.latitude, wp_A.longitude, wp_B.latitude, wp_B.longitude);
+
+        float distanceToPath;
+        
+        if (metrics.alongTrackDistance < 0) {
+            distanceToPath = calculateDistance(wp_A.latitude, wp_A.longitude, sensors.gpsLat, sensors.gpsLon);
+        } else if (metrics.alongTrackDistance > segmentLength) {
+            distanceToPath = calculateDistance(wp_B.latitude, wp_B.longitude, sensors.gpsLat, sensors.gpsLon);
+        } else {
+            distanceToPath = abs(metrics.cte);
+        }
+
+        if (distanceToPath < minDistanceToPath) {
+            minDistanceToPath = distanceToPath;
+            bestSegmentIndex = i;
+        }
+    }
+    
+    if (guidanceIsForward) {
+        currentWaypointIndex = bestSegmentIndex + 1;
+    } else {
+        currentWaypointIndex = bestSegmentIndex;
+    }
+    
+    guidanceActive = true;
+    lastConfirmationTime = millis();
+    lastVibrationTime = millis();
+    waypointJustPassed = false;
+    
+    pursuitCtrl.reset();
+    
+    Serial.println();
+    Serial.println("╔════════════════════════════════════════╗");
+    Serial.println("║      🧭 GUIDANCE ACTIVATED v3.1       ║");
+    if (guidanceIsForward) {
+        Serial.println("║          Mode: FORWARD                 ║");
+    } else {
+        Serial.println("║          Mode: BACKWARD                ║");
+    }
+    Serial.println("╚════════════════════════════════════════╝");
+    Serial.print("  Starting segment: ");
+    Serial.print(bestSegmentIndex);
+    Serial.print(" → ");
+    Serial.println(bestSegmentIndex+1);
+    Serial.print("  Distance to path: ");
+    Serial.print(minDistanceToPath, 1);
+    Serial.println("m");
+    Serial.println();
+}
+
+void updateGuidance() {
+    if (!guidanceActive || !sensors.gpsValid) return;
+
+    if ((guidanceIsForward && currentWaypointIndex >= waypointCount) || 
+        (!guidanceIsForward && currentWaypointIndex < 0)) {
+        Serial.println("\n🎯 DESTINATION REACHED!");
+        vibrateConfirmation();
+        motorCtrl.update();
+        delay(200);
+        vibrateConfirmation();
+        guidanceActive = false;
+        currentMode = MODE_IDLE;
+        pursuitCtrl.reset();
+        return;
+    }
+    
+    Waypoint wp_B = currentPath[currentWaypointIndex];
+    Waypoint wp_A;
+    
+    if (guidanceIsForward) { 
+        wp_A = currentPath[currentWaypointIndex - 1]; 
+    } else { 
+        if (currentWaypointIndex == waypointCount - 1) {
+            wp_A = currentPath[currentWaypointIndex - 1];
+        } else {
+            wp_A = currentPath[currentWaypointIndex + 1]; 
+        }
+    }
+    
+    // Calculate current metrics
+    PathMetrics currentMetrics = getPathMetrics(wp_A, wp_B, sensors.gpsLat, sensors.gpsLon);
+    
+    // Calculate path curvature
+    float pathCurvature = calculatePathCurvature(currentWaypointIndex, guidanceIsForward);
+    
+    // Apply EMA filter with adaptive alpha
+    float filteredCTE = pursuitCtrl.filterCTE(currentMetrics.cte, pathCurvature > SHARP_TURN_THRESHOLD);
+    
+    // Calculate adaptive look-ahead distance
+    float lookAheadDist = pursuitCtrl.calculateLookAhead(sensors.gpsSpeed, filteredCTE, pathCurvature);
+    
+    // Get segment properties
+    float segmentLength = calculateDistance(wp_A.latitude, wp_A.longitude, wp_B.latitude, wp_B.longitude);
+    
+    // Calculate look-ahead target point on the path
+    float targetAlongTrack = currentMetrics.alongTrackDistance + lookAheadDist;
+    
+    // Calculate target point coordinates using interpolation
+    float fraction = targetAlongTrack / segmentLength;
+    fraction = constrain(fraction, 0.0, 1.0);
+    
+    double targetLat = wp_A.latitude + fraction * (wp_B.latitude - wp_A.latitude);
+    double targetLon = wp_A.longitude + fraction * (wp_B.longitude - wp_A.longitude);
+    
+    // Calculate bearing to look-ahead target
+    float targetBearing = calculateBearing(sensors.gpsLat, sensors.gpsLon, targetLat, targetLon);
+    
+    // Apply heading rate limiter with adaptive rates
+    targetBearing = pursuitCtrl.limitHeadingChange(targetBearing, sensors.fusedHeading, 
+                                                    pathCurvature > SHARP_TURN_THRESHOLD);
+    
+    // Distance to current target waypoint
+    float distance_to_B = calculateDistance(sensors.gpsLat, sensors.gpsLon, wp_B.latitude, wp_B.longitude);
+    
+    // Verbose debug output
+    if (verboseMode && millis() % 2000 < 100) {
+        Serial.print("[PURSUIT] CTE: ");
+        Serial.print(filteredCTE, 1);
+        Serial.print("m | LA: ");
+        Serial.print(lookAheadDist, 1);
+        Serial.print("m | Curv: ");
+        Serial.print(pathCurvature, 0);
+        Serial.print("° | Speed: ");
+        Serial.print(sensors.gpsSpeed, 1);
+        Serial.print("m/s | Dist: ");
+        Serial.print(distance_to_B, 1);
+        Serial.println("m");
+    }
+    
+    // Waypoint passing with hysteresis
+    bool shouldPassWaypoint = false;
+    
+    if (waypointJustPassed) {
+        if (distance_to_B > (ARRIVAL_RADIUS + ARRIVAL_HYSTERESIS)) {
+            waypointJustPassed = false;
+        }
+    } else {
+        if (distance_to_B < ARRIVAL_RADIUS) {
+            shouldPassWaypoint = true;
+        }
+        
+        // Projection-based passing
+        if (guidanceIsForward) {
+            if (currentMetrics.alongTrackDistance > segmentLength) {
+                shouldPassWaypoint = true;
+            }
+        } else {
+            if (currentMetrics.alongTrackDistance < 0) {
+                shouldPassWaypoint = true;
+            }
+        }
+    }
+    
+    if (shouldPassWaypoint) {
+        Serial.print("✓ Passed waypoint ");
+        Serial.println(currentWaypointIndex);
+        vibrateConfirmation();
+        pursuitCtrl.reset();
+        waypointJustPassed = true;
+        
+        if (guidanceIsForward) { 
+            currentWaypointIndex++; 
+        } else { 
+            currentWaypointIndex--; 
+        }
+        
+        if ((guidanceIsForward && currentWaypointIndex >= waypointCount) || 
+            (!guidanceIsForward && currentWaypointIndex < 0)) {
+            return;
+        }
+        Serial.print("→ New target WP: ");
+        Serial.println(currentWaypointIndex);
+    }
+
+    // Speed-adaptive haptic feedback
+    float headingError = normalizeAngle(targetBearing - sensors.fusedHeading);
+    float absError = abs(headingError);
+    
+    float currentTolerance = (sensors.gpsSpeed > GPS_SPEED_THRESHOLD) ? 
+                             HEADING_TOLERANCE_MOVING : HEADING_TOLERANCE_SLOW;
+
+    if (absError < currentTolerance) {
+        if (millis() - lastConfirmationTime > CONFIRMATION_INTERVAL) {
+            vibrateConfirmation();
+            lastConfirmationTime = millis();
+        }
+    } else {
+        if (!motorCtrl.isVibrating && (millis() - lastVibrationTime > MIN_VIBRATION_INTERVAL)) {
+            float baseIntensity = map(absError, currentTolerance, 180, 30, 100) / 100.0;
+            
+            float cteBoost = 1.0;
+            if (abs(filteredCTE) > 20.0) {
+                cteBoost = 1.3;
+            }
+            
+            // Extra intensity boost for sharp turns
+            float turnBoost = 1.0;
+            if (pathCurvature > SHARP_TURN_THRESHOLD) {
+                turnBoost = 1.2;
+            }
+            
+            float intensity = constrain(baseIntensity * cteBoost * turnBoost, 0.3, 1.0);
+            
+            vibrateDirection(targetBearing, intensity);
+            lastVibrationTime = millis();
+        }
+    }
+}
+
+// ============================================================================
+// FILE STORAGE
+// ============================================================================
+void savePath(const char* filename) {
+    File file = SPIFFS.open(filename, "w");
+    if (!file) {
+        Serial.println("[ERROR] Failed to open file for writing");
+        return;
+    }
+    
+    file.write((uint8_t*)&waypointCount, sizeof(waypointCount));
+
+    for (int i = 0; i < waypointCount; i++) {
+        file.write((uint8_t*)&currentPath[i], sizeof(Waypoint));
+    }
+    
+    file.close();
+    Serial.print("[SAVE] Path saved to ");
+    Serial.print(filename);
+    Serial.print(" (");
+    Serial.print(waypointCount);
+    Serial.println(" waypoints)");
+}
+
+bool loadPath(const char* filename) {
+    File file = SPIFFS.open(filename, "r");
+    if (!file) {
+        Serial.println("[ERROR] Failed to open file for reading");
+        return false;
+    }
+    
+    file.read((uint8_t*)&waypointCount, sizeof(waypointCount));
+
+    if (waypointCount > MAX_WAYPOINTS || waypointCount < 0) {
+        Serial.println("[ERROR] Invalid waypoint count in file");
+        waypointCount = 0;
+        file.close();
+        return false;
+    }
+    
+    for (int i = 0; i < waypointCount; i++) {
+        file.read((uint8_t*)&currentPath[i], sizeof(Waypoint));
+    }
+    
+    file.close();
+    Serial.print("[LOAD] Path loaded from ");
+    Serial.print(filename);
+    Serial.print(" (");
+    Serial.print(waypointCount);
+    Serial.println(" waypoints)");
+    
+    return true;
+}
+
+// ============================================================================
+// WEB SERVER HANDLERS
+// ============================================================================
+void setupWiFi() {
+    Serial.println("[WIFI] Starting AP 'HapticHiker'...");
+    WiFi.softAP("HapticHiker", "hiker2024");
+    
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("[WIFI] IP: ");
+    Serial.println(IP);
+    
+    server.on("/", HTTP_GET, []() {
+        server.send_P(200, "text/html", HTML_INDEX);
+    });
+
+    server.on("/download", HTTP_GET, handleDownloadPath);
+    server.on("/status", HTTP_GET, handleStatus);
+    server.on("/upload", HTTP_POST, handleUploadSuccess, handleUploadFile);
+    
+    server.begin();
+    wifiEnabled = true;
+    Serial.println("[WIFI] Server started at http://192.168.4.1");
+}
+
+void handleUploadFile() {
+    HTTPUpload& upload = server.upload();
+    
+    if (upload.status == UPLOAD_FILE_START) {
+        Serial.print("[UPLOAD] Receiving: ");
+        Serial.println(upload.filename);
+        fsUploadFile = SPIFFS.open("/temp_upload.json", "w");
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (fsUploadFile) {
+            fsUploadFile.write(upload.buf, upload.currentSize);
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (fsUploadFile) {
+            fsUploadFile.close();
+            Serial.print("[UPLOAD] Received: ");
+            Serial.println(upload.totalSize);
+        }
+    }
+}
+
+void handleUploadSuccess() {
+    server.send(200, "text/plain", "Upload successful! Parsing file...");
+    parseUploadedJSON();
+}
+
+void parseUploadedJSON() {
+    File file = SPIFFS.open("/temp_upload.json", "r");
+    if (!file) {
+        Serial.println("[PARSE] Failed to open temp file");
+        return;
+    }
+
+    DynamicJsonDocument doc(8192);
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
+
+    if (error) {
+        Serial.print("[PARSE] Error: ");
+        Serial.println(error.c_str());
+        return;
+    }
+
+    JsonArray pathArray = doc.as<JsonArray>();
+    if (pathArray.isNull()) {
+        Serial.println("[PARSE] Not an array");
+        return;
+    }
+
+    waypointCount = 0;
+
+    for (JsonArray pair : pathArray) {
+        if (waypointCount >= MAX_WAYPOINTS) break;
+
+        currentPath[waypointCount].latitude = pair[0].as<double>();
+        currentPath[waypointCount].longitude = pair[1].as<double>();
+        currentPath[waypointCount].timestamp = 0;
+        
+        if (waypointCount > 0) {
+            currentPath[waypointCount - 1].bearing = calculateBearing(
+                currentPath[waypointCount - 1].latitude,
+                currentPath[waypointCount - 1].longitude,
+                currentPath[waypointCount].latitude,
+                currentPath[waypointCount].longitude
+            );
+            currentPath[waypointCount - 1].distance = calculateDistance(
+                currentPath[waypointCount - 1].latitude,
+                currentPath[waypointCount - 1].longitude,
+                currentPath[waypointCount].latitude,
+                currentPath[waypointCount].longitude
+            );
+        }
+        waypointCount++;
+    }
+
+    Serial.print("[PARSE] Loaded ");
+    Serial.print(waypointCount);
+    Serial.println(" waypoints");
+
+    savePath("/download.dat");
+    SPIFFS.remove("/temp_upload.json");
+}
+
+void handleDownloadPath() {
+    if (!loadPath("/path.dat")) {
+        server.send(500, "text/plain", "No path recorded");
+        return;
+    }
+
+    DynamicJsonDocument doc(8192);
+    JsonArray pathArray = doc.to<JsonArray>();
+
+    for (int i = 0; i < waypointCount; i++) {
+        JsonArray pair = pathArray.createNestedArray();
+        pair.add(currentPath[i].latitude);
+        pair.add(currentPath[i].longitude);
+    }
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    server.sendHeader("Content-Disposition", "attachment; filename=\"hiker_path.json\"");
+    server.send(200, "application/json", jsonString);
+}
+
+void handleStatus() {
+    DynamicJsonDocument doc(1024);
+    doc["mode"] = currentMode;
+    doc["gpsValid"] = sensors.gpsValid;
+    doc["heading"] = sensors.fusedHeading;
+    doc["compass"] = sensors.magHeading;
+    doc["waypointCount"] = waypointCount;
+    
+    String output;
+    serializeJson(doc, output);
+    
+    server.send(200, "application/json", output);
+}
+
+// ============================================================================
+// SERIAL COMMAND HANDLER
+// ============================================================================
+void handleSerialCommands() {
+    if (Serial.available() > 0) {
+        char cmd = Serial.read();
+        
+        switch (cmd) {
+            case 'c':
+            {
+                calibrateMagnetometer();
+                break;
+            }
+                
+            case 'r':
+            {
+                if (currentMode == MODE_RECORDING) {
+                    Serial.println("[RECORD] Already recording!");
+                } else if (sensors.gpsValid) {
+                    Serial.println("[RECORD] Starting new path recording...");
+                    waypointCount = 0;
+                    lastWaypointTime = millis();
+                    currentMode = MODE_RECORDING;
+                    recordWaypoint();
+                } else {
+                    Serial.println("[ERROR] Waiting for GPS fix (Sats >= 4, HDOP < 3.0)...");
+                }
+                break;
+            }
+                
+            case 's':
+            {
+                if (currentMode == MODE_RECORDING) {
+                    Serial.println("[RECORD] Stopping recording.");
+                    currentMode = MODE_IDLE;
+                    savePath("/path.dat");
+                } else {
+                    Serial.println("[CMD] Not in recording mode.");
+                }
+                break;
+            }
+            
+            case 'f':
+            {
+                if (currentMode == MODE_GUIDANCE) {
+                    Serial.println("[GUIDANCE] Already active. Send 'x' to stop.");
+                } else {
+                    Serial.println("[GUIDANCE] Starting FORWARD...");
+                    currentMode = MODE_GUIDANCE;
+                    startGuidance(true);
+                }
+                break;
+            }
+                
+            case 'g':
+            {
+                if (currentMode == MODE_GUIDANCE) {
+                    Serial.println("[GUIDANCE] Already active. Send 'x' to stop.");
+                } else {
+                    Serial.println("[GUIDANCE] Starting BACKWARD...");
+                    currentMode = MODE_GUIDANCE;
+                    startGuidance(false);
+                }
+                break;
+            }
+            
+            case 'x':
+            {
+                Serial.println("[CMD] Stopping all operations.");
+                currentMode = MODE_IDLE;
+                guidanceActive = false;
+                motorCtrl.stopAll();
+                pursuitCtrl.reset();
+                break;
+            }
+            
+            case 'w':
+            {
+                if (!wifiEnabled) {
+                    Serial.println("[CMD] Enabling WiFi...");
+                    setupWiFi();
+                } else {
+                    Serial.println("[WIFI] Already enabled.");
+                }
+                break;
+            }
+            
+            case 'l':
+            {
+                Serial.println("[CMD] Loading '/path.dat'...");
+                if (loadPath("/path.dat")) {
+                    Serial.println("[LOAD] Success!");
+                } else {
+                    Serial.println("[ERROR] Load failed.");
+                }
+                break;
+            }
+            
+            case 'd':
+            {
+                Serial.println("[CMD] Loading '/download.dat'...");
+                if (loadPath("/download.dat")) {
+                    Serial.println("[LOAD] Success!");
+                } else {
+                    Serial.println("[ERROR] Load failed.");
+                }
+                break;
+            }
+            
+            case 'v':
+            {
+                verboseMode = !verboseMode;
+                Serial.print("[CMD] Verbose mode: ");
+                Serial.println(verboseMode ? "ON" : "OFF");
+                break;
+            }
+            
+            case 'h':
+            {
+                Serial.println("\n=== HEADING DEBUG MODE ===");
+                Serial.println("Displaying raw sensor data for 10 seconds...");
+                Serial.println("Rotate device slowly and observe:");
+                Serial.println();
+                
+                unsigned long debugStart = millis();
+                while (millis() - debugStart < 10000) {
+                    updateIMU();
+                    updateMagnetometer();
+                    
+                    Serial.print("Mag Raw: X=");
+                    Serial.print(mx);
+                    Serial.print(" Y=");
+                    Serial.print(my);
+                    Serial.print(" Z=");
+                    Serial.print(mz);
+                    
+                    Serial.print(" | Madgwick Roll: ");
+                    Serial.print(sensors.roll, 1);
+                    Serial.print(" Pitch: ");
+                    Serial.print(sensors.pitch, 1);
+                    
+                    Serial.print(" | Tilt-Compensated MAG Heading: ");
+                    Serial.print(sensors.magHeading, 1);
+                    Serial.println("°");
+                    
+                    delay(500);
+                }
+                Serial.println("=== DEBUG END ===\n");
+                break;
+            }
+                
+            case 'i':
+            {
+                Serial.println("\n╔════════════════════════════════════════╗");
+                Serial.println("║        SYSTEM INFO v3.1                ║");
+                Serial.println("╚════════════════════════════════════════╝");
+                
+                Serial.print("  Mode: ");
+                switch(currentMode) {
+                    case MODE_IDLE: Serial.println("IDLE"); break;
+                    case MODE_RECORDING: Serial.println("RECORDING"); break;
+                    case MODE_GUIDANCE: Serial.println("GUIDANCE (Pure Pursuit)"); break;
+                    default: Serial.println("UNKNOWN"); break;
+                }
+                
+                Serial.print("  GPS Valid: "); 
+                Serial.println(sensors.gpsValid ? "YES" : "NO");
+                
+                if (sensors.gpsValid) {
+                    Serial.print("  Location: ");
+                    Serial.print(sensors.gpsLat, 6);
+                    Serial.print(", ");
+                    Serial.println(sensors.gpsLon, 6);
+                    
+                    Serial.print("  GPS Speed: ");
+                    Serial.print(sensors.gpsSpeed, 2);
+                    Serial.println(" m/s");
+                    
+                    Serial.print("  GPS Heading: ");
+                    Serial.print(sensors.gpsHeading, 1);
+                    Serial.println("°");
+                    
+                    Serial.print("  Satellites: ");
+                    Serial.println(gps.satellites.isValid() ? String(gps.satellites.value()) : "N/A");
+                    
+                    Serial.print("  HDOP: ");
+                    Serial.println(gps.hdop.isValid() ? String(gps.hdop.value() / 100.0) : "N/A");
+                }
+                
+                Serial.println("  ────────────────────────────────────────");
+                Serial.print("  Raw Mag Heading: ");
+                Serial.print(sensors.magHeading, 1);
+                Serial.println("° (magnetic)");
+                
+                Serial.print("  Madgwick Roll: ");
+                Serial.print(sensors.roll, 1);
+                Serial.print("°  Pitch: ");
+                Serial.print(sensors.pitch, 1);
+                Serial.println("°");
+                
+                Serial.print("  Compass Bias: ");
+                Serial.print(compassBias, 1);
+                Serial.println("°");
+                
+                Serial.print("  FUSED Heading: ");
+                Serial.print(sensors.fusedHeading, 1);
+                Serial.println("° (navigation)");
+                
+                Serial.print("  Declination: ");
+                Serial.print(MAGNETIC_DECLINATION_DEG, 1);
+                Serial.println("°");
+                
+                Serial.println("  ────────────────────────────────────────");
+                Serial.print("  Waypoints: "); 
+                Serial.println(waypointCount);
+                
+                if (guidanceActive) {
+                    Serial.print("  Target WP: "); 
+                    Serial.println(currentWaypointIndex);
+                    
+                    Serial.print("  Look-Ahead: ");
+                    Serial.print(pursuitCtrl.lookAheadDistance, 1);
+                    Serial.println("m");
+                    
+                    Serial.print("  Filtered CTE: ");
+                    Serial.print(pursuitCtrl.filteredCTE, 1);
+                    Serial.println("m");
+                    
+                    Serial.print("  Path Curvature: ");
+                    Serial.print(pursuitCtrl.currentCurvature, 0);
+                    Serial.println("°");
+                    
+                    Serial.print("  Sharp Turn: ");
+                    Serial.println(pursuitCtrl.inSharpTurn ? "YES" : "NO");
+                }
+                
+                Serial.print("  Verbose Mode: ");
+                Serial.println(verboseMode ? "ON" : "OFF");
+                
+                Serial.println("╚════════════════════════════════════════╝\n");
+                break;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// MAGNETOMETER CALIBRATION
+// ============================================================================
+void calibrateMagnetometer() {
+    Serial.println("\n════════════════════════════════════════");
+    Serial.println("    MAGNETOMETER CALIBRATION MODE");
+    Serial.println("════════════════════════════════════════");
+    Serial.println();
+    Serial.println("INSTRUCTIONS:");
+    Serial.println("1. Calibration will run for 30 seconds");
+    Serial.println("2. Rotate device in ALL directions:");
+    Serial.println("   - Roll left and right");
+    Serial.println("   - Pitch forward and back");
+    Serial.println("   - Rotate horizontally");
+    Serial.println("3. Move SLOWLY and cover all orientations");
+    Serial.println();
+    Serial.println("⚠  IMPORTANT:");
+    Serial.println("   - Keep motors OFF");
+    Serial.println("   - Stay away from metal objects");
+    Serial.println("   - Make figure-8 motions");
+    Serial.println();
+
+    SystemMode previousMode = currentMode;
+    currentMode = MODE_IDLE;
+    
+    Serial.println("Starting in 5 seconds...");
+    for (int i = 5; i > 0; i--) {
+        Serial.print(i);
+        Serial.println("...");
+        delay(1000);
+    }
+    
+    Serial.println("\n🔄 CALIBRATING - ROTATE THE DEVICE!");
+    Serial.println();
+
+    float mag_min[3] = {32767, 32767, 32767};
+    float mag_max[3] = {-32768, -32768, -32768};
+
+    unsigned long startTime = millis();
+    unsigned long duration = 30000;
+    int samples = 0;
+
+    while (millis() - startTime < duration) {
+        I2C_MAG.beginTransmission(HMC5883L_ADDR);
+        I2C_MAG.write(0x03);
+        I2C_MAG.endTransmission(false);
+        I2C_MAG.requestFrom(HMC5883L_ADDR, 6);
+        
+        if (I2C_MAG.available() >= 6) {
+            int16_t mx_raw = I2C_MAG.read() << 8 | I2C_MAG.read();
+            int16_t mz_raw = I2C_MAG.read() << 8 | I2C_MAG.read();
+            int16_t my_raw = I2C_MAG.read() << 8 | I2C_MAG.read();
+
+            if (mx_raw < mag_min[0]) mag_min[0] = mx_raw;
+            if (my_raw < mag_min[1]) mag_min[1] = my_raw;
+            if (mz_raw < mag_min[2]) mag_min[2] = mz_raw;
+            
+            if (mx_raw > mag_max[0]) mag_max[0] = mx_raw;
+            if (my_raw > mag_max[1]) mag_max[1] = my_raw;
+            if (mz_raw > mag_max[2]) mag_max[2] = mz_raw;
+            
+            samples++;
+            
+            if (samples % 500 == 0) {
+                unsigned long elapsed = (millis() - startTime) / 1000;
+                Serial.print("⏱  ");
+                Serial.print(elapsed);
+                Serial.print("/30s | Samples: ");
+                Serial.print(samples);
+                Serial.print(" | X: ");
+                Serial.print((int)(mag_max[0] - mag_min[0]));
+                Serial.print(" Y: ");
+                Serial.print((int)(mag_max[1] - mag_min[1]));
+                Serial.print(" Z: ");
+                Serial.println((int)(mag_max[2] - mag_min[2]));
+            }
+        }
+        
+        delay(10);
+    }
+    
+    Serial.println("\n✅ CALIBRATION COMPLETE!");
+    Serial.println();
+
+    mag_offset_x = (mag_max[0] + mag_min[0]) / 2.0;
+    mag_offset_y = (mag_max[1] + mag_min[1]) / 2.0;
+    mag_offset_z = (mag_max[2] + mag_min[2]) / 2.0;
+
+    float avg_range = ((mag_max[0] - mag_min[0]) + 
+                       (mag_max[1] - mag_min[1]) + 
+                       (mag_max[2] - mag_min[2])) / 3.0;
+
+    mag_scale_x = avg_range / (mag_max[0] - mag_min[0]);
+    mag_scale_y = avg_range / (mag_max[1] - mag_min[1]);
+    mag_scale_z = avg_range / (mag_max[2] - mag_min[2]);
+    
+    Serial.println("NEW CALIBRATION VALUES:");
+    Serial.print("  Offset X: "); Serial.println(mag_offset_x, 2);
+    Serial.print("  Offset Y: "); Serial.println(mag_offset_y, 2);
+    Serial.print("  Offset Z: "); Serial.println(mag_offset_z, 2);
+    Serial.print("  Scale X:  "); Serial.println(mag_scale_x, 4);
+    Serial.print("  Scale Y:  "); Serial.println(mag_scale_y, 4);
+    Serial.print("  Scale Z:  "); Serial.println(mag_scale_z, 4);
+    Serial.println();
+    
+    bool goodCalibration = true;
+    for (int i = 0; i < 3; i++) {
+        float range = mag_max[i] - mag_min[i];
+        if (range < 200) {
+            goodCalibration = false;
+            Serial.println("⚠  WARNING: Low range detected!");
+            break;
+        }
+    }
+    
+    if (goodCalibration) {
+        Serial.println("✓ Calibration quality looks good!");
+    }
+    
+    Serial.println("\n💾 Values now active in memory.");
+    Serial.println("   Copy to code for permanent storage:");
+    Serial.println();
+    Serial.print("float mag_offset_x = "); Serial.print(mag_offset_x, 2); Serial.println(";");
+    Serial.print("float mag_offset_y = "); Serial.print(mag_offset_y, 2); Serial.println(";");
+    Serial.print("float mag_offset_z = "); Serial.print(mag_offset_z, 2); Serial.println(";");
+    Serial.print("float mag_scale_x = "); Serial.print(mag_scale_x, 4); Serial.println(";");
+    Serial.print("float mag_scale_y = "); Serial.print(mag_scale_y, 4); Serial.println(";");
+    Serial.print("float mag_scale_z = "); Serial.print(mag_scale_z, 4); Serial.println(";");
+    Serial.println();
+    Serial.println("════════════════════════════════════════\n");
+
+    currentMode = previousMode;
+}
